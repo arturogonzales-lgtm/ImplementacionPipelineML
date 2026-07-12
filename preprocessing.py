@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Configuracion
 NAN_THRESHOLD = 80
-VALIDATION_CODMES = 201912.0
+VALIDATION_CODMES = 202212.0
 TEST_SIZE = 0.30
 RANDOM_STATE = 123
 OUTPUT_DIR = "data/processed"
@@ -130,6 +130,24 @@ def run_preprocessing(data_path, nan_threshold=NAN_THRESHOLD, fit_encoders=True,
         df = pd.read_csv(data_path)
     
     print(f"Dataset original: {df.shape}")
+    
+    if "p_codmes" not in df.columns:
+        if "p_fecinformacion" in df.columns:
+            print("Deriving 'p_codmes' from 'p_fecinformacion'...")
+            df["p_codmes"] = (df["p_fecinformacion"].astype(float) // 100).astype(float)
+        else:
+            print("Warning: Neither 'p_codmes' nor 'p_fecinformacion' found. Using default 202212.0.")
+            df["p_codmes"] = 202212.0
+    
+    if is_training and len(df) > 50000:
+        print(f"Downsampling dataset from {len(df)} to 50000 rows for development speed...")
+        df_val_rows = df[df["p_codmes"] == VALIDATION_CODMES]
+        df_other_rows = df[df["p_codmes"] != VALIDATION_CODMES]
+        sampled_val = df_val_rows.sample(n=min(len(df_val_rows), 10000), random_state=RANDOM_STATE) if len(df_val_rows) > 0 else df_val_rows
+        sampled_other = df_other_rows.sample(n=min(len(df_other_rows), 40000), random_state=RANDOM_STATE) if len(df_other_rows) > 0 else df_other_rows
+        df = pd.concat([sampled_val, sampled_other], ignore_index=True)
+        print(f"New shape after downsampling: {df.shape}")
+        
     cols_drop = calculo_nan(df, nan_threshold)
     df = df.drop(columns=cols_drop, errors="ignore")
     print(f"Dataset procesado: {df.shape}")

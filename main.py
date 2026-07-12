@@ -65,7 +65,7 @@ def pipeline_training(input_path):
         os.path.join(OUTPUT_DIR, "df_train.csv"),
         os.path.join(OUTPUT_DIR, "df_test.csv"),
         os.path.join(OUTPUT_DIR, "df_val.csv"),
-        n_trials=30,
+        n_trials=2,
         experiment_name="cu_venta_e2e"
     )
     print(f"✓ Entrenamiento completado")
@@ -78,6 +78,9 @@ def pipeline_training(input_path):
     TARGET_COL = "target"
     drop_cols = [c for c in ID_COLS + [TARGET_COL] if c in df_val.columns]
     X_val = df_val.drop(columns=drop_cols, errors="ignore")
+    object_cols = X_val.select_dtypes(include=["object", "category"]).columns.tolist()
+    if object_cols:
+        X_val = X_val.drop(columns=object_cols)
     
     val_scores = model.predict_proba(X_val)[:, 1]
     monitoring_results = run_monitoring(df_train, df_val, val_scores)
@@ -185,14 +188,41 @@ def pipeline_inference(input_path, auto_retrain=False, retrain_threshold_psi=0.2
         df_inf_post = df_inference[cols_post + ["prob_value_contact"]].copy() if "prob_value_contact" in df_inference.columns else df_inference[cols_post].copy()
         df_inf_post["prob_value_contact"] = df_inf_post.get("prob_value_contact", 0.5).fillna(0.5)
     
-    df_resultado = run_postprocessing(inference_scores, df_inf_post,
-                                      os.path.join(POSTPROCESSING_DIR, "output_tlv_inference.csv"))
+    # Obtener particion o mes del dataset de origen para nombrar los archivos de salida
+    partition_val = "unknown"
+    if "partition" in df_inference.columns and len(df_inference) > 0:
+        partition_val = str(df_inference["partition"].iloc[0]).strip()
+    elif "p_codmes" in df_inference.columns and len(df_inference) > 0:
+        partition_val = str(int(df_inference["p_codmes"].iloc[0]))
+    elif "p_fecinformacion" in df_inference.columns and len(df_inference) > 0:
+        partition_val = str(int(df_inference["p_fecinformacion"].iloc[0]))
+        
+    output_filename = f"output_tlv_inference_{partition_val}.csv"
+    print(f"Los resultados se guardaran en: {output_filename}")
     
+    df_resultado = run_postprocessing(inference_scores, df_inf_post,
+                                      os.path.join(POSTPROCESSING_DIR, output_filename))
+
     # Verificar matriz de ejecucion
     matrix_check = check_execution_matrix(df_resultado, min_count_per_group=50)
     
     print(f"✓ Postprocesamiento completado")
     print(f"✓ Matriz de ejecucion: {matrix_check}\n")
+    
+    # Guardar en un archivo csv matrix_check con referencia a la particion de origen
+    matrix_data = {
+        "partition": [partition_val],
+        "matrix_healthy": [matrix_check.get("matrix_healthy", True)],
+        "should_retrain": [matrix_check.get("should_retrain", False)],
+        "reason": [matrix_check.get("reason", "")]
+    }
+    for g in range(1, 11):
+        matrix_data[f"group_{g}"] = [matrix_check.get("groups", {}).get(str(g), 0)]
+        
+    df_matrix_report = pd.DataFrame(matrix_data)
+    matrix_report_path = os.path.join(MONITORING_DIR, f"matrix_check_{partition_val}.csv")
+    df_matrix_report.to_csv(matrix_report_path, index=False)
+    print(f"✓ Reporte de matriz de ejecucion guardado en: {matrix_report_path}")
     
     # Guardar replica
     print("Guardando replicas...")

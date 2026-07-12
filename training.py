@@ -26,7 +26,13 @@ Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 def _xy(df):
     """Separa features y target."""
     drop = [c for c in ID_COLS + [TARGET_COL] if c in df.columns]
-    return df.drop(columns=drop, errors="ignore"), df[TARGET_COL]
+    X = df.drop(columns=drop, errors="ignore")
+    # Descarta cualquier columna tipo object o categórica restante
+    object_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    if object_cols:
+        print(f"Descantado columnas no numéricas desprovistas de encoders: {object_cols}")
+        X = X.drop(columns=object_cols)
+    return X, df[TARGET_COL]
 
 
 def train_and_log(train_path, test_path, val_path=None, n_trials=30, 
@@ -72,14 +78,14 @@ def train_and_log(train_path, test_path, val_path=None, n_trials=30,
             "use_label_encoder": False,
             "eval_metric": "logloss",
             "random_state": 123,
+            "early_stopping_rounds": 20,
         }
         
         model = xgb.XGBClassifier(**params, verbosity=0)
         model.fit(
             X_train, y_train,
             eval_set=[(X_test, y_test)],
-            verbose=False,
-            early_stopping_rounds=20
+            verbose=False
         )
         
         # Metricas en test
