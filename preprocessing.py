@@ -1,263 +1,166 @@
-"""Preprocessing module for CU Venta pipeline.
+"""
+preprocessing.py -- Limpieza y transformacion del dataset CU Venta.
 
-This module reads all raw CSV files, applies cleaning/imputation/encoding,
-creates train/test/validation splits, and persists processed artifacts.
+Produce: df_train.csv, df_test.csv, df_val.csv
 """
 
-from __future__ import annotations
-
-import json
-from pathlib import Path
-from typing import Any
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import pickle
+import os
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from pathlib import Path
 
-# Business defaults inspired by the class notebooks.
-NAN_THRESHOLD = 80.0
+# Configuracion
+NAN_THRESHOLD = 80
+VALIDATION_CODMES = 201912.0
 TEST_SIZE = 0.30
 RANDOM_STATE = 123
-TARGET_COL = "target"
+OUTPUT_DIR = "data/processed"
+ENCODER_DIR = "data/models"
 
-ZERO_IMPUTE_COLS = [
-    "flg_saltothip12m",
-    "flg_saltotppe12m",
-    "prm_pctsaltototrent12m",
-    "prm_pctsaltotcaja12m",
-    "ant_saltot24m",
-    "ant_saltot12m",
-    "min_difsaltottcr12m",
-    "num_incrsaldispefe06m",
-    "max_difent12m",
-    "num_dismsalppecons06m",
-    "beta_pctusotcr12m",
-    "prm_pctusosaltottcr03m",
-    "dsv_saltotppe03m",
-    "prm_diasatrrdpn12m",
-    "dsv_numentrdlintcr03m",
-    "rat_disefepnm01",
-    "prm_diasatrrdpn06m",
-    "pct_usotcrm01",
-    "dsv_numentrdlintcr06m",
-    "beta_saltotppe12m",
-    "prm_entrd03m",
-    "ctd_entrdm01",
-    "beta_saltotppe06m",
-    "prm_diasatrrd03m",
-    "prm_saltotrdpj03m",
-    "prm_saltotrdpj12m",
-    "dsv_diasatrrdpj12m",
-    "max_pctsalimpago12m",
-    "prm_diasatrrdpj03m",
-    "ctd_campecstlv06m",
-    "max_camptot06m",
-    "min_camptot06m",
-    "frc_camptot06m",
-    "rec_camptot06m",
-    "ctd_camptot06m",
-    "prm_camptot06m",
-    "max_campecs06m",
-    "min_campecs06m",
-    "frc_campecs06m",
-    "rec_campecs06m",
-    "ctd_campecs06m",
-    "prm_campecs06m",
-    "seg_un",
-]
-
-CATEGORICAL_FILL_VALUES = {
-    "ubigeo_buro": "Otros",
-    "grp_riesgociiu": "grupo_0",
-    "grp_camptot06m": "Otro",
-    "grp_campecs06m": "Otro",
-    "region": "Otro",
-}
-
-NON_ENCODE_COLS = {
-    "_source_file",
-    "partition",
-    "key_value",
-    "codunicocli",
-    "fch_creacion",
-    "p_fecinformacion",
-}
+# Crear directorios si no existen
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(ENCODER_DIR).mkdir(parents=True, exist_ok=True)
 
 
-def _infer_validation_partition(df: pd.DataFrame) -> str | None:
-    if "partition" not in df.columns:
-        return None
-    partitions = sorted(df["partition"].dropna().astype(str).unique())
-    if not partitions:
-        return None
-    return partitions[-1]
+def calculo_nan(df, threshold=NAN_THRESHOLD):
+    """Identifica columnas con exceso de NaN."""
+    cols_drop = []
+    for c in df.columns:
+        porc_nan = df[c].isna().sum() / len(df[c]) * 100
+        if porc_nan > threshold:
+            print(f"Descartando {c}: {porc_nan:.2f}% NaN")
+            cols_drop.append(c)
+    return cols_drop
 
 
-def _business_recoding(df: pd.DataFrame) -> pd.DataFrame:
-    if "seg_un" in df.columns:
-        df["seg_un"] = np.where(df["seg_un"].isin([0, 3]), 0, df["seg_un"])
-
-    if "grp_riesgociiu" in df.columns:
-        group_map = ["grupo_2", "grupo_3", "grupo_9", "grupo_8", "grupo_1"]
-        df["grp_riesgociiu"] = np.where(
-            df["grp_riesgociiu"].isin(group_map),
-            "grupo_11",
-            df["grp_riesgociiu"],
-        )
-    return df
-
-
-def _safe_json(data: dict[str, Any]) -> dict[str, Any]:
-    def convert(value: Any) -> Any:
-        if isinstance(value, (np.integer, np.floating)):
-            return value.item()
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, dict):
-            return {k: convert(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [convert(v) for v in value]
-        return value
-
-    return convert(data)
-
-
-def _load_input_data(input_dir: Path) -> tuple[pd.DataFrame, list[Path]]:
-    csv_paths = sorted(input_dir.glob("*.csv"))
-    if not csv_paths:
-        raise FileNotFoundError(f"No CSV files found in {input_dir}")
-
-    frames: list[pd.DataFrame] = []
-    for csv_path in csv_paths:
-        frame = pd.read_csv(csv_path)
-        frame["_source_file"] = csv_path.name
-        frames.append(frame)
-
-    df = pd.concat(frames, ignore_index=True)
-    return df, csv_paths
-
-
-def _apply_imputations(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ZERO_IMPUTE_COLS:
-        if col in df.columns:
+def imputar_variables(df):
+    """Imputa valores faltantes segun criterio experto."""
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        if "cnt" in col or "num" in col or "ctd" in col or "flg" in col:
             df[col] = df[col].fillna(0)
-
     if "edad" in df.columns:
         df["edad"] = df["edad"].fillna(df["edad"].median())
-
-    for col, value in CATEGORICAL_FILL_VALUES.items():
-        if col in df.columns:
-            df[col] = df[col].fillna(value)
-
+    if "ubigeo_buro" in df.columns:
+        df["ubigeo_buro"] = df["ubigeo_buro"].fillna("Otros")
+    if "grp_riesgociiu" in df.columns:
+        df["grp_riesgociiu"] = df["grp_riesgociiu"].fillna("grupo_0")
+    if "region" in df.columns:
+        df["region"] = df["region"].fillna("Otro")
+    if "grp_camptot06m" in df.columns:
+        df["grp_camptot06m"] = df["grp_camptot06m"].fillna("Otro")
+    if "grp_campecs06m" in df.columns:
+        df["grp_campecs06m"] = df["grp_campecs06m"].fillna("Otro")
+    df_numeric = df.select_dtypes(include=[np.number])
+    for col in df_numeric.columns:
+        if df[col].isna().sum() > 0:
+            df[col] = df[col].fillna(0)
     return df
 
 
-def _encode_object_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[str]]]:
-    encoders: dict[str, list[str]] = {}
-    object_cols = [c for c in df.columns if str(df[c].dtype) in {"object", "string"} and c not in NON_ENCODE_COLS]
-    for col in object_cols:
-        le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].astype(str))
-        encoders[col] = le.classes_.tolist()
+def transformar_categoricas(df):
+    """Transforma variables categoricas."""
+    if "grp_riesgociiu" in df.columns:
+        df["grp_riesgociiu"] = pd.Series(np.where(
+            df["grp_riesgociiu"].isin(["grupo_2", "grupo_3", "grupo_9", "grupo_8", "grupo_1"]),
+            "grupo_11", df["grp_riesgociiu"]
+        ))
+    if "seg_un" in df.columns:
+        df["seg_un"] = pd.Series(np.where(
+            df["seg_un"].isin([0, 3]), 0, df["seg_un"]
+        ))
+    return df
+
+
+def encodear_variables(df, encoders=None, fit=True):
+    """Encodea variables categoricas."""
+    features_encoder = [
+        "grp_camptottlv06m", "grp_campecstlv06m", "grp_camptot06m", 
+        "grp_campecs06m", "region", "grp_riesgociiu", "ubigeo_buro"
+    ]
+    features_encoder = [c for c in features_encoder if c in df.columns]
+    if encoders is None:
+        encoders = {}
+    for col in features_encoder:
+        if fit:
+            encoder = LabelEncoder()
+            encoder.fit(df[col].astype(str))
+            encoders[col] = encoder
+        else:
+            encoder = encoders.get(col)
+            if encoder is None:
+                encoder = LabelEncoder()
+                encoder.fit(df[col].astype(str))
+                encoders[col] = encoder
+        df[col] = encoder.transform(df[col].astype(str))
     return df, encoders
 
 
-def _split_dataset(
-    df: pd.DataFrame,
-    test_size: float,
-    random_state: int,
-    validation_partition: str | None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str | None]:
-    if validation_partition is None:
-        validation_partition = _infer_validation_partition(df)
+def asignar_tipos_datos(df):
+    """Asigna tipos de datos."""
+    if "target" in df.columns:
+        df["target"] = df["target"].astype("int32")
+    if "monto" in df.columns:
+        df["monto"] = df["monto"].astype("float64")
+    if "p_codmes" in df.columns:
+        df["p_codmes"] = df["p_codmes"].astype("float64")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        if col not in ["target", "monto", "p_codmes"]:
+            df[col] = df[col].astype("float64")
+    return df
 
-    if validation_partition and "partition" in df.columns:
-        val_mask = df["partition"].astype(str) == str(validation_partition)
-        if val_mask.any():
-            df_val = df[val_mask].copy()
-            df_main = df[~val_mask].copy()
-        else:
-            inferred = _infer_validation_partition(df)
-            if inferred is not None and inferred != validation_partition:
-                validation_partition = inferred
-                val_mask = df["partition"].astype(str) == str(validation_partition)
-                df_val = df[val_mask].copy()
-                df_main = df[~val_mask].copy()
-            else:
-                df_main, df_val = train_test_split(df, test_size=test_size, random_state=random_state)
-                validation_partition = None
+
+def run_preprocessing(data_path, nan_threshold=NAN_THRESHOLD, fit_encoders=True, 
+                      encoders_path=None, is_training=True):
+    """Ejecuta el pipeline completo de preprocesamiento."""
+    if os.path.isdir(data_path):
+        csv_files = list(Path(data_path).glob("*.csv"))
+        dfs = []
+        for f in csv_files:
+            try:
+                dfs.append(pd.read_csv(f))
+            except Exception as e:
+                print(f"Error: {f}: {e}")
+        df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     else:
-        df_main, df_val = train_test_split(df, test_size=test_size, random_state=random_state)
-
-    stratify_col = df_main[TARGET_COL] if TARGET_COL in df_main.columns else None
-    df_train, df_test = train_test_split(
-        df_main,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=stratify_col,
-    )
-    return df_train, df_test, df_val, validation_partition
-
-
-def run_preprocessing(
-    input_dir: str | Path,
-    output_dir: str | Path = "data/processed",
-    nan_threshold: float = NAN_THRESHOLD,
-    test_size: float = TEST_SIZE,
-    random_state: int = RANDOM_STATE,
-    validation_partition: str | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Run full preprocessing and save train/test/validation CSVs.
-
-    Returns:
-        df_train, df_test, df_val, metadata
-    """
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    df, csv_paths = _load_input_data(input_dir)
-    df = df.replace(["", "null", "None"], np.nan)
-
-    cols_drop = [c for c in df.columns if df[c].isna().mean() * 100 > nan_threshold]
-    df = df.drop(columns=cols_drop)
-
-    df = _apply_imputations(df)
-    df = _business_recoding(df)
-    df, encoders = _encode_object_columns(df)
-    df_train, df_test, df_val, validation_partition = _split_dataset(
-        df=df,
-        test_size=test_size,
-        random_state=random_state,
-        validation_partition=validation_partition,
-    )
-
-    train_path = output_dir / "df_train.csv"
-    test_path = output_dir / "df_test.csv"
-    val_path = output_dir / "df_val.csv"
-    meta_path = output_dir / "metadata.json"
-
-    df_train.to_csv(train_path, index=False)
-    df_test.to_csv(test_path, index=False)
-    df_val.to_csv(val_path, index=False)
-
-    metadata: dict[str, Any] = {
-        "input_files": [p.name for p in csv_paths],
-        "rows_total": int(len(df)),
-        "rows_train": int(len(df_train)),
-        "rows_test": int(len(df_test)),
-        "rows_val": int(len(df_val)),
-        "dropped_columns": cols_drop,
-        "encoders": encoders,
-        "validation_partition": validation_partition,
-        "target_col": TARGET_COL,
-        "train_path": str(train_path),
-        "test_path": str(test_path),
-        "val_path": str(val_path),
-    }
-
-    with meta_path.open("w", encoding="utf-8") as fp:
-        json.dump(_safe_json(metadata), fp, indent=2)
-
-    return df_train, df_test, df_val, metadata
+        df = pd.read_csv(data_path)
+    
+    print(f"Dataset original: {df.shape}")
+    cols_drop = calculo_nan(df, nan_threshold)
+    df = df.drop(columns=cols_drop, errors="ignore")
+    print(f"Dataset procesado: {df.shape}")
+    
+    df = imputar_variables(df)
+    df = transformar_categoricas(df)
+    
+    if fit_encoders or encoders_path is None:
+        df, encoders = encodear_variables(df, fit=True)
+        encoder_file = os.path.join(ENCODER_DIR, "label_encoders.pkl")
+        with open(encoder_file, "wb") as f:
+            pickle.dump(encoders, f)
+    else:
+        with open(encoders_path, "rb") as f:
+            encoders = pickle.load(f)
+        df, _ = encodear_variables(df, encoders=encoders, fit=False)
+    
+    df = asignar_tipos_datos(df)
+    
+    metadata = {"dropped": cols_drop, "n_samples": len(df), "n_features": df.shape[1]}
+    
+    if is_training and "p_codmes" in df.columns:
+        df_val = df[df["p_codmes"] == VALIDATION_CODMES].copy()
+        df_main = df[df["p_codmes"] != VALIDATION_CODMES].copy()
+        df_train, df_test = train_test_split(
+            df_main, test_size=TEST_SIZE, random_state=RANDOM_STATE
+        )
+        df_train.to_csv(os.path.join(OUTPUT_DIR, "df_train.csv"), index=False)
+        df_test.to_csv(os.path.join(OUTPUT_DIR, "df_test.csv"), index=False)
+        df_val.to_csv(os.path.join(OUTPUT_DIR, "df_val.csv"), index=False)
+        return df_train, df_test, df_val, metadata
+    else:
+        df.to_csv(os.path.join(OUTPUT_DIR, "df_inference.csv"), index=False)
+        return df, None, None, metadata

@@ -1,132 +1,277 @@
-"""Main orchestrator for ML E2E pipeline.
+"""
+main.py -- Orquestador del pipeline ML E2E.
 
-Run example:
-python main.py --input_dir data/raw
+Ejecutar:
+    # Pipeline de entrenamiento
+    python main.py --mode training --input "data/raw/"
+    
+    # Pipeline de inferencia
+    python main.py --mode inference --input "data/raw/p1_extrac.csv"
+    
+    # Con monitoreo y re-entrenamiento automático
+    python main.py --mode inference --input "data/raw/p1_extrac.csv" --auto-retrain
 """
 
-from __future__ import annotations
-
 import argparse
+import sys
+import pickle
+import os
+import json
+from datetime import datetime
 from pathlib import Path
 
-from monitoring import run_monitoring
-from postprocessing import run_postprocessing, save_replica
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score, recall_score
+
 from preprocessing import run_preprocessing
-from training import train_and_log
+from training import train_and_log, load_best_model, predict_inference
+from monitoring import (
+    run_monitoring, compute_recall_by_decile, check_drift, check_execution_matrix
+)
+from postprocessing import run_postprocessing, save_replica, generate_execution_report
+
+# Configuracion
+INPUT_PATH = "data/raw/"
+OUTPUT_DIR = "data/processed"
+MODEL_DIR = "data/models"
+MONITORING_DIR = "data/monitoring"
+POSTPROCESSING_DIR = "data/postprocessed"
+
+# Crear directorios
+for d in [OUTPUT_DIR, MODEL_DIR, MONITORING_DIR, POSTPROCESSING_DIR]:
+    Path(d).mkdir(parents=True, exist_ok=True)
 
 
-ID_COL_CANDIDATES = [
-    "partition",
-    "key_value",
-    "codunicocli",
-    "tip_doc",
-    "fch_creacion",
-    "p_fecinformacion",
-    "_source_file",
-]
-TARGET_COL = "target"
-
-
-def _feature_frame(df):
-    drop_cols = [c for c in ID_COL_CANDIDATES + [TARGET_COL] if c in df.columns]
-    return df.drop(columns=drop_cols)
-
-
-def _need_retraining(monitor_summary: dict, post_df) -> bool:
-    psi_status = monitor_summary.get("psi_status", "OK")
-    groups_ok = "grupo_ejec_tlv" in post_df.columns and post_df["grupo_ejec_tlv"].notna().sum() > 0
-    return psi_status == "ALERT" or not groups_ok
-
-
-def run_pipeline(args: argparse.Namespace) -> None:
-    print("[1/5] Preprocessing...")
-    df_train, _, df_val, meta = run_preprocessing(
-        input_dir=args.input_dir,
-        output_dir=args.processed_dir,
-        nan_threshold=args.nan_threshold,
-        validation_partition=args.validation_partition,
+def pipeline_training(input_path):
+    """
+    Ejecuta el pipeline completo de entrenamiento.
+    """
+    print("\n" + "="*80)
+    print("PIPELINE DE ENTRENAMIENTO")
+    print("="*80 + "\n")
+    
+    # 1. Preprocesamiento
+    print("[1/4] PREPROCESAMIENTO...")
+    df_train, df_test, df_val, meta_prep = run_preprocessing(
+        input_path, is_training=True, fit_encoders=True
     )
-
-    print("[2/5] Training with HPO...")
-    run_id, model, train_metrics = train_and_log(
-        train_path=Path(args.processed_dir) / "df_train.csv",
-        test_path=Path(args.processed_dir) / "df_test.csv",
-        val_path=Path(args.processed_dir) / "df_val.csv",
-        model_dir=args.model_dir,
-        n_trials=args.n_trials,
-        experiment_name=args.experiment_name,
+    print(f"✓ Preprocesamiento completado")
+    print(f"  Train: {df_train.shape}, Test: {df_test.shape}, Val: {df_val.shape}\n")
+    
+    # 2. Entrenamiento con HPO
+    print("[2/4] ENTRENAMIENTO CON OPTUNA (HPO)...")
+    run_id, model, best_params, metrics = train_and_log(
+        os.path.join(OUTPUT_DIR, "df_train.csv"),
+        os.path.join(OUTPUT_DIR, "df_test.csv"),
+        os.path.join(OUTPUT_DIR, "df_val.csv"),
+        n_trials=30,
+        experiment_name="cu_venta_e2e"
     )
+    print(f"✓ Entrenamiento completado")
+    print(f"  Run ID: {run_id}")
+    print(f"  Metricas: {metrics}\n")
+    
+    # 3. Monitoreo
+    print("[3/4] MONITOREO...")
+    ID_COLS = ["p_codmes", "key_value"]
+    TARGET_COL = "target"
+    drop_cols = [c for c in ID_COLS + [TARGET_COL] if c in df_val.columns]
+    X_val = df_val.drop(columns=drop_cols, errors="ignore")
+    
+    val_scores = model.predict_proba(X_val)[:, 1]
+    monitoring_results = run_monitoring(df_train, df_val, val_scores)
+    
+    recall_df = compute_recall_by_decile(df_val[TARGET_COL], val_scores)
+    print(f"✓ Monitoreo completado")
+    print(f"  PSI: {monitoring_results.get('psi', 'N/A')}")
+    print(f"  Recall by decile:\n{recall_df}\n")
+    
+    # 4. Postprocesamiento
+    print("[4/4] POSTPROCESAMIENTO...")
+    cols_post = ["p_codmes", "key_value", "grp_campecs06m", "monto"]
+    cols_post = [c for c in cols_post if c in df_val.columns]
+    
+    if not cols_post or len(df_val[cols_post]) == 0:
+        print("Advertencia: Columnas de postprocesamiento no encontradas. Usando defaults.")
+        df_val_post = df_val[[c for c in df_val.columns if c not in drop_cols]].head()
+        df_val_post["grp_campecs06m"] = "G1"
+        df_val_post["monto"] = 1000
+        df_val_post["prob_value_contact"] = 0.5
+    else:
+        df_val_post = df_val[cols_post + ["prob_value_contact"]].copy()
+        df_val_post["prob_value_contact"] = df_val_post.get("prob_value_contact", 0.5).fillna(0.5)
+    
+    df_resultado = run_postprocessing(val_scores, df_val_post, 
+                                      os.path.join(POSTPROCESSING_DIR, "output_tlv_train.csv"))
+    
+    exec_report = generate_execution_report(df_resultado)
+    print(f"✓ Postprocesamiento completado\n")
+    print(exec_report)
+    
+    # Guardar metadata
+    metadata = {
+        "pipeline": "training",
+        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "metrics": metrics,
+        "best_params": best_params,
+        "preprocessing": meta_prep
+    }
+    
+    with open(os.path.join(MODEL_DIR, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=4, default=str)
+    
+    print("="*80)
+    print(f"✓ ENTRENAMIENTO COMPLETADO EXITOSAMENTE")
+    print("="*80 + "\n")
 
-    print("[3/5] Monitoring...")
-    X_train = _feature_frame(df_train)
-    x_val = _feature_frame(df_val)
 
-    train_scores = model.predict_proba(X_train)[:, 1]
-    val_scores = model.predict_proba(x_val)[:, 1]
-
-    monitor_summary = run_monitoring(
-        df_train=df_train,
-        df_val=df_val,
-        train_scores=train_scores,
-        val_scores=val_scores,
-        target_col=TARGET_COL,
-        output_dir=args.monitoring_dir,
-        mlflow_active=True,
+def pipeline_inference(input_path, auto_retrain=False, retrain_threshold_psi=0.25):
+    """
+    Ejecuta el pipeline completo de inferencia.
+    """
+    print("\n" + "="*80)
+    print("PIPELINE DE INFERENCIA")
+    print("="*80 + "\n")
+    
+    # 1. Preprocesamiento
+    print("[1/4] PREPROCESAMIENTO...")
+    encoder_path = os.path.join(MODEL_DIR, "label_encoders.pkl")
+    df_inference, _, _, _ = run_preprocessing(
+        input_path, is_training=False, fit_encoders=False, 
+        encoders_path=encoder_path
     )
-
-    print("[4/5] Postprocessing + replica...")
-    df_post = run_postprocessing(
-        scores=val_scores,
-        df_post=df_val,
-        output_path=args.post_path,
-    )
-
-    partition = args.replica_partition or str(meta.get("validation_partition") or "unknown")
-    replica_paths = save_replica(
-        df_post,
-        table=args.replica_table,
-        partition=partition,
-    )
-
-    if _need_retraining(monitor_summary, df_post):
-        print("[5/5] Monitoring alert detected (PSI/group matrix). Automatic retraining...")
-        run_id, model, train_metrics = train_and_log(
-            train_path=Path(args.processed_dir) / "df_train.csv",
-            test_path=Path(args.processed_dir) / "df_test.csv",
-            val_path=Path(args.processed_dir) / "df_val.csv",
-            model_dir=args.model_dir,
-            n_trials=max(args.n_trials, 40),
-            experiment_name=args.experiment_name,
+    print(f"✓ Preprocesamiento completado: {df_inference.shape}\n")
+    
+    # 2. Cargar modelo
+    print("[2/4] CARGANDO MODELO...")
+    model = load_best_model()
+    print(f"✓ Modelo cargado\n")
+    
+    # 3. Predicciones
+    print("[3/4] GENERANDO PREDICCIONES...")
+    inference_scores = predict_inference(df_inference, model)
+    print(f"✓ Predicciones completadas: {len(inference_scores)} registros\n")
+    
+    # 4. Monitoreo y detección de drift
+    print("[4/4] MONITOREO Y DETECCION DE DRIFT...")
+    
+    # Cargar baseline de entrenamiento si existe
+    baseline_file = os.path.join(MODEL_DIR, "baseline_scores.npy")
+    if os.path.exists(baseline_file):
+        baseline_scores = np.load(baseline_file)
+        drift_check = check_drift(
+            inference_scores, df_inference, 
+            train_baseline_scores=baseline_scores,
+            psi_threshold_alert=retrain_threshold_psi
         )
     else:
-        print("[5/5] Pipeline finished without retraining alerts.")
+        drift_check = {"has_drift": False, "should_retrain": False}
+    
+    print(f"✓ Drift check completado: {drift_check}\n")
+    
+    # 5. Postprocesamiento
+    print("[5/5] POSTPROCESAMIENTO...")
+    cols_post = ["grp_campecs06m", "monto", "key_value"]
+    cols_post = [c for c in cols_post if c in df_inference.columns]
+    
+    if not cols_post:
+        df_inf_post = df_inference.copy()
+        df_inf_post["grp_campecs06m"] = "G1"
+        df_inf_post["monto"] = 1000
+        df_inf_post["prob_value_contact"] = 0.5
+    else:
+        df_inf_post = df_inference[cols_post + ["prob_value_contact"]].copy() if "prob_value_contact" in df_inference.columns else df_inference[cols_post].copy()
+        df_inf_post["prob_value_contact"] = df_inf_post.get("prob_value_contact", 0.5).fillna(0.5)
+    
+    df_resultado = run_postprocessing(inference_scores, df_inf_post,
+                                      os.path.join(POSTPROCESSING_DIR, "output_tlv_inference.csv"))
+    
+    # Verificar matriz de ejecucion
+    matrix_check = check_execution_matrix(df_resultado, min_count_per_group=50)
+    
+    print(f"✓ Postprocesamiento completado")
+    print(f"✓ Matriz de ejecucion: {matrix_check}\n")
+    
+    # Guardar replica
+    print("Guardando replicas...")
+    partition = datetime.now().strftime("%Y%m%d")
+    save_replica(df_resultado, table="EC_OMNICANAL", partition=partition)
+    print("✓ Replicas guardadas\n")
+    
+    # Guardar baseline si no existe
+    if not os.path.exists(baseline_file):
+        np.save(baseline_file, inference_scores)
+        print(f"Baseline guardado en {baseline_file}")
+    
+    # RE-ENTRENAMIENTO AUTOMATICO
+    if auto_retrain and (drift_check.get("should_retrain") or matrix_check.get("should_retrain")):
+        print("\n" + "="*80)
+        print("⚠  RE-ENTRENAMIENTO AUTOMATICO DISPARADO")
+        print("="*80 + "\n")
+        print(f"Razon (Drift): {drift_check.get('reason', 'N/A')}")
+        print(f"Razon (Matrix): {matrix_check.get('reason', 'N/A')}\n")
+        
+        # Ejecutar entrenamiento
+        pipeline_training(INPUT_PATH)
+        
+        print("\n" + "="*80)
+        print("✓ RE-ENTRENAMIENTO COMPLETADO")
+        print("="*80 + "\n")
+    
+    # Resumen final
+    print("="*80)
+    print(f"✓ INFERENCIA COMPLETADA")
+    print(f"  Registros procesados: {len(df_resultado)}")
+    print(f"  Drift status: {drift_check.get('status', 'OK')}")
+    print(f"  Matriz de ejecucion saludable: {matrix_check.get('matrix_healthy', True)}")
+    print("="*80 + "\n")
 
-    print("----- SUMMARY -----")
-    print(f"Run ID: {run_id}")
-    print(f"Train/Test/Val AUC: {train_metrics['train_auc']:.4f} / {train_metrics['test_auc']:.4f} / {train_metrics['val_auc']:.4f}")
-    print(f"PSI: {monitor_summary['psi_score']:.4f} ({monitor_summary['psi_status']})")
-    print(f"Postprocessed output: {args.post_path}")
-    print("Replica outputs:")
-    for p in replica_paths:
-        print(f" - {p}")
 
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CU Venta ML E2E pipeline")
-    parser.add_argument("--input_dir", default="data/raw", help="Directory with raw CSV files")
-    parser.add_argument("--processed_dir", default="data/processed", help="Processed output directory")
-    parser.add_argument("--model_dir", default="data/models", help="Directory to save trained model")
-    parser.add_argument("--monitoring_dir", default="data/monitoring", help="Monitoring artifacts directory")
-    parser.add_argument("--post_path", default="data/postprocessed/output_tlv.csv", help="Postprocessed output CSV path")
-    parser.add_argument("--n_trials", type=int, default=30, help="Optuna trials")
-    parser.add_argument("--nan_threshold", type=float, default=80.0, help="Drop columns above this NaN percent")
-    parser.add_argument("--validation_partition", default=None, help="Optional explicit validation partition")
-    parser.add_argument("--experiment_name", default="cu_venta_e2e", help="MLflow experiment name")
-    parser.add_argument("--replica_table", default="EC_OMNICANAL", help="Replica output model/table name")
-    parser.add_argument("--replica_partition", default=None, help="Replica partition (e.g. 202412)")
-    return parser
+def main():
+    """Orquestador principal."""
+    parser = argparse.ArgumentParser(
+        description="Pipeline ML E2E para CU Venta (Entrenamiento + Inferencia)"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["training", "inference"],
+        required=True,
+        help="Modo de ejecucion"
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=INPUT_PATH,
+        help="Ruta de entrada (directorio para training, CSV para inference)"
+    )
+    parser.add_argument(
+        "--auto-retrain",
+        action="store_true",
+        help="Habilitar re-entrenamiento automatico en caso de drift"
+    )
+    parser.add_argument(
+        "--psi-threshold",
+        type=float,
+        default=0.25,
+        help="Umbral de PSI para disparar re-entrenamiento"
+    )
+    
+    args = parser.parse_args()
+    
+    try:
+        if args.mode == "training":
+            pipeline_training(args.input)
+        elif args.mode == "inference":
+            pipeline_inference(args.input, auto_retrain=args.auto_retrain, 
+                             retrain_threshold_psi=args.psi_threshold)
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    run_pipeline(parser.parse_args())
+    main()
