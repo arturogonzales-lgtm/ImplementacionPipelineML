@@ -1,0 +1,10 @@
+artifact_location: file:///C:/IdeaProjects/tareaUCSP/ImplementacionPipelineML/mlruns/955035057205746014/models/m-74ef5cfe672849e99d1d401977a2826e/artifacts
+creation_timestamp: 1783873159052
+experiment_id: '955035057205746014'
+last_updated_timestamp: 1783873184058
+model_id: m-74ef5cfe672849e99d1d401977a2826e
+model_type: null
+name: model
+source_run_id: c6a43fa0e09347dc9d714f7a846003f8
+status: 2
+status_message: null
