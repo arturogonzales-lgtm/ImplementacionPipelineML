@@ -1,0 +1,34 @@
+{
+    "pipeline": "training",
+    "timestamp": "2026-07-12T11:19:44.665426",
+    "run_id": "c6a43fa0e09347dc9d714f7a846003f8",
+    "metrics": {
+        "train_auc": 0.9986329821623615,
+        "train_recall": 0.7577706323687031,
+        "test_auc": 0.826595463064453,
+        "test_recall": 0.014705882352941176,
+        "test_precision": 0.5,
+        "test_f1": 0.02857142857142857,
+        "val_auc": 0.8348760947066575,
+        "val_recall": 0.0036231884057971015
+    },
+    "best_params": {
+        "n_estimators": 357,
+        "max_depth": 10,
+        "learning_rate": 0.043334781694031266,
+        "subsample": 0.7828432571242385,
+        "colsample_bytree": 0.8581381503291124,
+        "min_child_weight": 7,
+        "gamma": 1.142214768962961,
+        "use_label_encoder": false,
+        "eval_metric": "logloss",
+        "random_state": 123
+    },
+    "preprocessing": {
+        "dropped": [
+            "prm_saltotrdpj03m"
+        ],
+        "n_samples": 50000,
+        "n_features": 69
+    }
+}

@@ -1,0 +1,22 @@
+artifact_path: file:///C:/IdeaProjects/tareaUCSP/ImplementacionPipelineML/mlruns/955035057205746014/models/m-4f463e97f3db41f194b32462bdd34647/artifacts
+flavors:
+  python_function:
+    data: model.xgb
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.9.7
+  xgboost:
+    code: null
+    data: model.xgb
+    model_class: xgboost.sklearn.XGBClassifier
+    model_format: xgb
+    xgb_version: 2.1.4
+mlflow_version: 3.1.4
+model_id: m-4f463e97f3db41f194b32462bdd34647
+model_size_bytes: 2219551
+model_uuid: m-4f463e97f3db41f194b32462bdd34647
+prompts: null
+run_id: ed93d4deb5344435bbb101e1147d31db
+utc_time_created: '2026-07-12 16:16:48.332050'

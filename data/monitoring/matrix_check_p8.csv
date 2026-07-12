@@ -1,0 +1,2 @@
+partition,matrix_healthy,should_retrain,reason,group_1,group_2,group_3,group_4,group_5,group_6,group_7,group_8,group_9,group_10
+p8,True,False,Matriz de ejecucion saludable,12037,21184,18054,29609,32498,32739,37553,36108,12518,8426
