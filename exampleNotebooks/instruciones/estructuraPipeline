@@ -1,0 +1,124 @@
+# Especificación Técnica de Arquitectura: Pipelines de ML (Entrenamiento e Inferencia)
+
+Este documento describe la arquitectura de dos pipelines complementarios para un mismo proyecto de Machine Learning: **Pipeline de Entrenamiento** y **Pipeline de Inferencia (Réplica)**. Está diseñado con una estructura semántica estricta para permitir su correcta interpretación, procesamiento y automatización por parte de un agente de Inteligencia Artificial o un sistema de orquestación.
+
+---
+
+## 1. Componentes Globales y Almacenamiento
+
+La arquitectura utiliza un ecosistema de almacenamiento distribuido y versionado para garantizar la reproducibilidad y el monitoreo continuo:
+
+*   **Origen de Datos (`Drive - DVC - mysql`):** Repositorio central de datos crudos. Soporta almacenamiento en la nube, versionado de datos mediante DVC (Data Version Control) y bases de datos relacionales SQL.
+*   **Data Procesada (Entrenamiento):** Almacenamiento intermedio para los conjuntos de datos limpios y transformados, divididos en conjuntos de `train` y `test`.
+*   **MLFlow / Registro de Modelos (`Modelos + métricas + hiperparams`):** Sistema de seguimiento de experimentos donde se registran los hiperparámetros, curvas de aprendizaje, artefactos y métricas de rendimiento de todas las ejecuciones de AutoML.
+*   **Modelo Finalista + Metadata:** Repositorio centralizado (Model Registry) que almacena exclusivamente el modelo seleccionado para producción junto con sus metadatos asociados.
+*   **Data Procesada (Inferencia):** Almacenamiento intermedio del pipeline de réplica que guarda los estados intermedios del lote procesado (`data_preproc`) y los resultados posteriores (`data_posproc`).
+*   **M (Monitoreo / MLFlow):** Componentes transversales en el pipeline de inferencia encargados de registrar métricas de salud del sistema, tiempos de ejecución y análisis de data drift (desviación de datos).
+*   **Resultado Final:** Repositorio de destino donde se disponibilizan las predicciones finales para consumo de negocio.
+
+---
+
+## 2. Pipeline de Entrenamiento
+
+**Objetivo:** Procesar datos históricos en bloque, ejecutar una búsqueda automatizada de modelos (AutoML) con optimización de hiperparámetros, evaluar estabilidad y registrar el mejor modelo.
+
+### 2.1 Flujo de Datos y Conexiones
+1. Lee datos masivos o históricos en bloque (`read all csv o parquet`) desde el almacenamiento origen (`Drive - DVC - mysql`).
+2. El orquestador invoca los módulos de manera secuencial.
+3. Almacena y recupera datos limpios del repositorio `Data procesada`.
+4. Registra los experimentos en `MLFlow`.
+5. Exporta el artefacto final hacia el almacén de `Modelo finalista + metadata`.
+
+### 2.2 Especificación de Módulos
+
+```
+[main.py (Orquestador)]
+       │
+       ▼
+[preprocessing.py] ──(Guarda train/test)──> [Data procesada]
+       │                                           │
+       ▼                                           ▼
+[AutoML (HPO + Selección)] <───────────────────────┘
+       │
+       ▼
+[model registry] ──> [Modelos + métricas + hiperparams] (MLFlow)
+       │
+       └───> [Modelo finalista + metadata]
+```
+
+*   **`main.py` (Orquestador):**
+    *   *Función:* Punto de entrada principal. Administra la secuencia de ejecución, el manejo de variables de entorno y los parámetros globales del entrenamiento.
+*   **`preprocessing.py`:**
+    *   *Función:* Limpieza de datos, imputación de nulos, codificación de variables categóricas, ingeniería de características (feature engineering) y partición de datos.
+    *   *Salidas:* Archivos particionados de `train` y `test` enviados directamente al almacén de `Data procesada`.
+*   **`AutoML` (Bloque de Optimización y Selección):**
+    *   *Componente HPO:* Optimización de Hiperparámetros (Hyperparameter Optimization) mediante algoritmos de búsqueda (ej. Bayesian Optimization, GridSearch).
+    *   *Componente "get best model":* Filtra y selecciona el modelo finalista bajo criterios duales: **Performance** (métricas de precisión, recall, F1, etc.) y **Estabilidad** (resistencia al sobreajuste, consistencia entre train y test).
+    *   *Entradas:* Datos desde `Data procesada`.
+*   **`model registry`:**
+    *   *Función:* Interfaz de salida del pipeline. Envía la trazabilidad completa (hiperparámetros y métricas) a MLFlow y guarda el modelo empaquetado (`.pkl`, `.onnx`, etc.) en el almacenamiento de modelos finalistas.
+
+---
+
+## 3. Pipeline de Inferencia (Réplica)
+
+**Objetivo:** Ejecutar de forma periódica o programada ("mes a mes") la lectura de nuevos datos, aplicar transformaciones idénticas a las de entrenamiento, realizar predicciones utilizando el modelo finalista y organizar la salida final.
+
+### 3.1 Flujo de Datos y Conexiones
+1. Lee datos incrementales o periódicos con frecuencia mensual desde `Drive - DVC - mysql`.
+2. Interactúa de forma bidireccional con el almacén local de `Data procesada` para control de cambios intermedios.
+3. Descarga de forma síncrona el artefacto desde `Modelo finalista + metadata`.
+4. Envía logs y telemetría a los módulos de Monitoreo (`M`).
+5. Escribe los resultados consolidados en la base de datos de `Resultado final`.
+
+### 3.2 Especificación de Módulos
+
+```
+[main.py (Orquestador)]
+       │
+       ▼
+[preprocessing.py] <───(data_preproc)───> [Data procesada]
+       │                                         ▲
+       ▼                                         │
+[inference.py] <─────(Carga modelo)────── [Modelo finalista]
+       │                                         │
+       ▼                                         ▼
+[Posprocessing.py] <───(data_posproc)───> [Data procesada]
+       │
+       ▼
+[Resultado final]
+```
+
+*   **`main.py` (Orquestador):**
+    *   *Función:* Dispara el proceso mensual, valida la disponibilidad de los datos de entrada y coordina la ejecución de las fases de inferencia.
+*   **`preprocessing.py`:**
+    *   *Función:* Transforma los datos crudos mensuales aplicando exactamente el mismo pipeline de ingeniería de características definido en el entrenamiento.
+    *   *I/O:* Almacena y lee estados intermedios bajo la etiqueta `data_preproc` en `Data procesada`.
+*   **`inference.py`:**
+    *   *Función:* Carga el modelo productivo desde `Modelo finalista + metadata` en memoria y genera las predicciones probabilísticas o categóricas sobre los datos preprocesados.
+    *   *Control:* Conectado de forma nativa a un módulo `M` para detectar variaciones estadísticas en los datos de entrada (Data Drift).
+*   **`Posprocessing.py`:**
+    *   *Función:* Aplicación de reglas de negocio, umbrales de decisión (thresholding), formateo de campos, des-normalización de variables y estructuración de la salida.
+    *   *I/O:* Interactúa con `Data procesada` generando la traza `data_posproc`.
+*   **`Resultado final`:**
+    *   *Función:* Destino de persistencia donde se consolida la información para su explotación por analistas o sistemas cliente.
+
+---
+
+## 4. Instrucciones Operativas para el Agente (System Prompts)
+
+Si eres un agente encargado de programar, auditar o ejecutar estos pipelines, debes seguir estrictamente las siguientes reglas de diseño y validación:
+
+### Regla 1: Simetría de Preprocesamiento
+*   El archivo `preprocessing.py` en el pipeline de inferencia debe ser funcionalmente idéntico o heredar las clases/transformaciones entrenadas (como selectores, escaladores y codificadores) generadas por el `preprocessing.py` del pipeline de entrenamiento. **Prohibido hardcodear transformaciones manuales en inferencia.**
+
+### Regla 2: Aislamiento de Entradas
+*   **Entrenamiento:** Configurar lecturas masivas tipo "Batch/Bulk" (`read all csv o parquet`).
+*   **Inferencia:** Configurar consultas parametrizadas por tiempo (`mes a mes`) para evitar fugas de memoria o reprocesamiento de históricos innecesarios.
+
+### Regla 3: Trazabilidad Obligatoria (MLFlow & M)
+*   Toda ejecución de entrenamiento debe iniciar un contexto de MLFlow (`mlflow.start_run()`) para registrar parámetros y métricas del bloque AutoML.
+*   Toda ejecución de inferencia debe capturar tiempos de respuesta, tasa de valores nulos entrantes y exportar las métricas de monitoreo (`M`) para auditorías de degradación del modelo.
+
+### Regla 4: Criterio de Selección de Modelos
+*   Al automatizar el componente `get best model`, no utilices únicamente la métrica de performance más alta (ej. Accuracy). Debes programar una validación cruzada (Cross-Validation) y penalizar aquellos modelos que presenten una desviación estándar alta entre los diferentes folds (criterio de **estabilidad**).
